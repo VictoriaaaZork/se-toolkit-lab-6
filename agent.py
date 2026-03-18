@@ -1,146 +1,126 @@
 #!/usr/bin/env python3
+"""Agent CLI that calls an LLM with tools to answer questions from the wiki."""
+
 import json
-import os
+import re
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
+from typing import Any
+
+import httpx
+
+MAX_TOOL_CALLS = 10
+PROJECT_ROOT = Path(__file__).parent.resolve()
+MAX_TOOL_RESULT_LENGTH = 4000
 
 
-ENV_FILE = ".env.agent.secret"
-REQUEST_TIMEOUT_SECONDS = 50
-
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-
-def load_env_file(path: str) -> None:
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
+def load_env_file(path: Path) -> dict[str, str]:
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
             continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if (
-            len(value) >= 2
-            and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'"))
-        ):
-            value = value[1:-1]
-
-        os.environ.setdefault(key, value)
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
 
 
-def require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+def load_agent_env() -> dict[str, str]:
+    return load_env_file(Path(".env.agent.secret"))
 
 
-def build_request_payload(model: str, question: str) -> dict:
-    return {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a concise assistant. Answer the user's question directly.",
-            },
-            {
-                "role": "user",
-                "content": question,
-            },
-        ],
-        "temperature": 0,
-    }
+def is_safe_path(requested_path: str) -> bool:
+    full_path = (PROJECT_ROOT / requested_path).resolve()
+    return str(full_path).startswith(str(PROJECT_ROOT))
 
 
-def extract_answer(response_json: dict) -> str:
+def read_file(path: str) -> str:
+    if not is_safe_path(path):
+        return f"Error: Access denied - path '{path}' is outside project directory"
+    full_path = PROJECT_ROOT / path
+    if not full_path.exists():
+        return f"Error: File not found - '{path}'"
+    if not full_path.is_file():
+        return f"Error: Not a file - '{path}'"
     try:
-        return response_json["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, AttributeError, TypeError) as exc:
-        raise RuntimeError("Invalid LLM response format") from exc
+        return full_path.read_text()
+    except Exception as e:
+        return f"Error reading file: {e}"
 
 
-def call_llm(api_base: str, api_key: str, model: str, question: str) -> str:
-    base = api_base.rstrip("/")
-    url = f"{base}/chat/completions"
-
-    payload = build_request_payload(model, question)
-    data = json.dumps(payload).encode("utf-8")
-
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
+def list_files(path: str) -> str:
+    if not is_safe_path(path):
+        return f"Error: Access denied - path '{path}' is outside project directory"
+    full_path = PROJECT_ROOT / path
+    if not full_path.exists():
+        return f"Error: Directory not found - '{path}'"
+    if not full_path.is_dir():
+        return f"Error: Not a directory - '{path}'"
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            raw_body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM HTTP error {exc.code}: {error_body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"LLM connection error: {exc}") from exc
-
-    try:
-        response_json = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("LLM returned invalid JSON") from exc
-
-    return extract_answer(response_json)
+        entries = []
+        for entry in sorted(full_path.iterdir()):
+            suffix = "/" if entry.is_dir() else ""
+            entries.append(f"{entry.name}{suffix}")
+        return "\n".join(entries)
+    except Exception as e:
+        return f"Error listing directory: {e}"
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        eprint('Usage: uv run agent.py "Your question"')
-        return 1
-
-    question = sys.argv[1].strip()
-    if not question:
-        eprint("Question must not be empty")
-        return 1
-
-    try:
-        load_env_file(ENV_FILE)
-
-        api_key = require_env("LLM_API_KEY")
-        api_base = require_env("LLM_API_BASE")
-        model = require_env("LLM_MODEL")
-
-        answer = call_llm(
-            api_base=api_base,
-            api_key=api_key,
-            model=model,
-            question=question,
-        )
-
-        result = {
-            "answer": answer,
-            "tool_calls": [],
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the project repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path from project root"}
+                },
+                "required": ["path"]
+            }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files and directories at a given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative directory path from project root"}
+                },
+                "required": ["path"]
+            }
+        }
+    }
+]
 
-        print(json.dumps(result, ensure_ascii=False))
-        return 0
 
-    except Exception as exc:
-        eprint(f"Error: {exc}")
-        return 1
+SYSTEM_PROMPT = """You are a documentation assistant. Use tools to navigate the wiki.
+
+Tools: list_files, read_file
+
+Process:
+1. Use list_files to discover wiki files
+2. Use read_file to read relevant files
+3. Find the answer and include source as: file_path#section_anchor
+
+When you have the answer, respond with text (no tool calls) including the answer and source."""
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
+    if tool_name == "read_file":
+        result = read_file(args.get("path", ""))
+    elif tool_name == "list_files":
+        result = list_files(args.get("path", ""))
+    else:
+        result = f"Error: Unknown tool '{tool_name}'"
+    if len(result) > MAX_TOOL_RESULT_LENGTH:
+        result = result[:MAX_TOOL_RESULT_LENGTH] + "\n\n[...truncated...]"
+    return result
