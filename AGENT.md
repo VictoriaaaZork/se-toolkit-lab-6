@@ -1,43 +1,40 @@
-# Agent Architecture
+# Agent Architecture - Task 3: The System Agent
 
-## Task 2: The Documentation Agent
+## Overview
+The system agent uses three tools to answer questions about wiki documentation, source code, and backend API data.
 
-### Architecture
+## Tools
+1. list_files - List files in directories
+2. read_file - Read file contents (wiki, source code, configs)
+3. query_api - Query backend LMS API with LMS_API_KEY authentication
 
-User Question  agent.py  LLM API  tool_calls  Execute tools  Feed back  Final answer
-
-### Agentic Loop
-
+## Agentic Loop
 1. Send question + tool definitions to LLM
 2. LLM decides which tool to call
-3. Execute tool (read_file / list_files)
-4. Feed result back to LLM
-5. Repeat until text answer or max 10 iterations
+3. Execute tool, feed result back
+4. Repeat until text answer or max 10 iterations
 
-### Tools
+## Environment Variables
 
-#### read_file
-Read a file from the project repository.
-- Parameters: path (string) - Relative path from project root
-- Security: No ../ traversal allowed
+| Variable | Source |
+|----------|--------|
+| LLM_API_KEY, LLM_API_BASE, LLM_MODEL | .env.agent.secret |
+| LMS_API_KEY | .env.docker.secret |
+| AGENT_API_BASE_URL | env (default: http://localhost:42002) |
 
-#### list_files
-List files and directories at a given path.
-- Parameters: path (string) - Relative directory path
-- Security: No ../ traversal allowed
+## Output Format
 
-### Output Format
 {
   "answer": "...",
-  "source": "wiki/file.md#section",
-  "tool_calls": [{"tool": "...", "args": {...}, "result": "..."}]
+  "source": "wiki/file.md#section or GET /endpoint",
+  "tool_calls": [...]
 }
 
-### Path Security
-def is_safe_path(requested_path: str) -> bool:
-    full_path = (PROJECT_ROOT / requested_path).resolve()
-    return str(full_path).startswith(str(PROJECT_ROOT))
+## Running
 
-### Running
-uv run agent.py "How do you resolve a merge conflict?"
-uv run pytest backend/tests/unit/test_agent_task2.py -v
+uv run agent.py "Your question"
+uv run run_eval.py
+
+## Lessons Learned
+
+Building the system agent revealed that tool descriptions critically affect LLM tool selection. The query_api tool must correctly authenticate with LMS_API_KEY from .env.docker.secret (not to be confused with LLM_API_KEY). Environment variable flexibility is essential since the autochecker injects different values. Error handling in tools allows the agent to see API errors for bug diagnosis. Result truncation at 4000 characters prevents context window overflow. Source extraction handles both file paths and API endpoints.
