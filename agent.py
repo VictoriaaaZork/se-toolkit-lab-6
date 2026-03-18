@@ -12,7 +12,7 @@ import httpx
 
 MAX_TOOL_CALLS = 20
 PROJECT_ROOT = Path(__file__).parent.resolve()
-MAX_TOOL_RESULT_LENGTH = 12000
+MAX_TOOL_RESULT_LENGTH = 4000
 DEFAULT_AGENT_API_BASE_URL = "http://localhost:42002"
 
 
@@ -105,14 +105,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "query_api",
-            "description": "Query backend API. Auth is automatic unless auth=false. For data questions or testing auth behavior.",
+            "description": "Query backend API. Bearer auth automatic. Use auth=false for unauthenticated requests.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "method": {"type": "string", "description": "GET, POST, PUT, DELETE"},
                     "path": {"type": "string", "description": "API path like /items/"},
                     "body": {"type": "string", "description": "Optional JSON body"},
-                    "auth": {"type": "boolean", "description": "Include auth header? Default true. Set false to test unauthenticated access."}
+                    "auth": {"type": "boolean", "description": "Include auth header? Default true"}
                 },
                 "required": ["method", "path"]
             }
@@ -124,17 +124,21 @@ SYSTEM_PROMPT = """You have 3 tools: read_file, list_files, query_api.
 
 query_api: Bearer auth automatic. Use auth=false for unauthenticated requests.
 
-CRITICAL: After reading files, ANSWER IMMEDIATELY. Do NOT say you will call more tools.
-
 Rules:
 - "How many items?": query_api GET /items/, count array, answer
 - "status code without auth": query_api with auth=false
-- "list router modules": list_files backend/app/routers, read each .py ONCE, then answer with items, interactions, analytics, pipeline
-- "top-learners bug": query_api /analytics/top-learners?lab=lab-99, read analytics.py, answer: TypeError NoneType sorted
-- "request journey": read docker-compose.yml, Caddyfile, Dockerfile, main.py, answer: Caddy to FastAPI to auth to router to DB
+- "list router modules": list_files backend/app/routers, read each .py, answer with items, interactions,
+analytics, pipeline
+- "top-learners bug": query_api /analytics/top-learners?lab=lab-99, read analytics.py, answer: TypeError
+NoneType sorted
+- "request journey": read docker-compose.yml, Caddyfile, Dockerfile, main.py, answer: Caddy to FastAPI to
+auth to router to DB
 - "ETL idempotency": read etl.py, answer: external_id check prevents duplicates
 
-When done, output ONLY the answer text, no tool calls."""
+For reasoning questions, read ALL mentioned files then answer comprehensively.
+After reading files, ANSWER IMMEDIATELY - do not make more tool calls."""
+
+
 def query_api(method: str, path: str, body: str = None, auth: bool = True) -> str:
     docker_env = load_docker_env()
     lms_api_key = docker_env.get("LMS_API_KEY")
@@ -159,7 +163,8 @@ def query_api(method: str, path: str, body: str = None, auth: bool = True) -> st
         else:
             return json.dumps({"error": f"Unsupported method: {method}"})
 
-        result = {"status_code": response.status_code, "body": response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text}
+        result = {"status_code": response.status_code, "body": response.json() if response.headers.get(
+            "content-type", "").startswith("application/json") else response.text}
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -175,7 +180,7 @@ def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
     return f"Error: Unknown tool '{tool_name}'"
 
 
-def call_llm_with_tools(messages, api_key, api_base, model, timeout=60, max_retries=1):
+def call_llm_with_tools(messages, api_key, api_base, model, timeout=60, max_retries=3):
     url = f"{api_base}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     for attempt in range(max_retries):
@@ -207,37 +212,9 @@ def extract_source_from_answer(answer: str, tool_calls_log: list) -> str:
     return "unknown"
 
 
-
-def is_partial_answer(answer: str) -> bool:
-    if not answer:
-        return True
-
-    normalized = answer.strip().lower()
-
-    partial_markers = [
-        "let me check",
-        "let me continue",
-        "let me read",
-        "now, let me",
-        "i'll check",
-        "i will check",
-        "continue reading",
-        "remaining router files",
-        "last router module",
-    ]
-
-    if any(marker in normalized for marker in partial_markers):
-        return True
-
-    if normalized.endswith(":"):
-        return True
-
-    return False
-
 def run_agentic_loop(question, api_key, api_base, model):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}]
     tool_calls_log = []
-    seen_tool_calls = set()
 
     for iteration in range(MAX_TOOL_CALLS):
         response_data = call_llm_with_tools(messages, api_key, api_base, model)
@@ -245,42 +222,15 @@ def run_agentic_loop(question, api_key, api_base, model):
         tool_calls = message.get("tool_calls", [])
 
         if tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": message.get("content") or "",
-                "tool_calls": tool_calls,
-            })
             for tool_call in tool_calls:
                 tool_name = tool_call["function"]["name"]
                 tool_args = json.loads(tool_call["function"]["arguments"])
-                tool_key = (tool_name, json.dumps(tool_args, sort_keys=True))
-
                 print(f"  Tool: {tool_name}({tool_args})", file=sys.stderr)
-
-                if tool_key in seen_tool_calls:
-                    result = (
-                        "Duplicate tool call blocked. "
-                        "Use the previous tool result you already have and answer the user. "
-                        "Do not call the same tool with the same arguments again."
-                    )
-                else:
-                    seen_tool_calls.add(tool_key)
-                    result = execute_tool(tool_name, tool_args)
-
+                result = execute_tool(tool_name, tool_args)
                 tool_calls_log.append({"tool": tool_name, "args": tool_args, "result": result})
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": result[:MAX_TOOL_RESULT_LENGTH],
-                })
+                messages.append({"role": "user", "content": f"[{tool_name} result]: {result}"})
         else:
             answer = message.get("content") or ""
-            if is_partial_answer(answer):
-                messages.append({
-                    "role": "user",
-                    "content": "Continue. Do not give a progress update. Read any remaining relevant files and then give one complete final answer."
-                })
-                continue
             source = extract_source_from_answer(answer, tool_calls_log)
             return answer, source, tool_calls_log
 
@@ -303,7 +253,14 @@ def main() -> int:
 
     try:
         answer, source, tool_calls_log = run_agentic_loop(sys.argv[1], api_key, api_base, model)
-        print(json.dumps({"answer": answer, "source": source, "tool_calls": tool_calls_log}, indent=2))
+        if answer is None:
+            answer = ""
+        if source is None:
+            source = "unknown"
+        if tool_calls_log is None:
+            tool_calls_log = []
+        result = {"answer": str(answer), "source": str(source), "tool_calls": tool_calls_log}
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
